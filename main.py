@@ -1,452 +1,508 @@
 import os
+import json
 import asyncio
-import tempfile
-from io import BytesIO
-from PIL import Image, ImageDraw, ImageFont
-import mutagen
-from mutagen.id3 import ID3, APIC, TIT2, TPE1, TALB, TDRC, TCON
+import logging
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 from mutagen.mp3 import MP3
+from mutagen.id3 import ID3, APIC, TIT2, TPE1, TALB, TPE2, TYER, TCON
+from mutagen import File
 from pydub import AudioSegment
-from pydub.silence import detect_nonsilent
-import telebot
-from telebot.async_telebot import AsyncTeleBot
-from telebot import types
-import aiofiles
+from pydub.silence import trim_silence
+from PIL import Image, ImageDraw, ImageFont
+import subprocess
 import re
+import tempfile
+import shutil
 
-# توکن ربات تلگرام
-BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"
-bot = AsyncTeleBot(BOT_TOKEN)
+# تنظیمات لاگ
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# مسیر فایل امضای صوتی
-SIGNATURE_AUDIO_PATH = "signature.mp3"  # فایل امضای صوتی که باید در پوشه ربات باشد
+# توکن ربات را اینجا قرار دهید
+BOT_TOKEN = "7906827162:AAGWZAC4gjuNZbqC_FOvY7R1qBy_G07SUj4"
 
-# ذخیره اطلاعات کاربران
-user_sessions = {}
+# مسیر فایل‌های پیکربندی
+CONFIG_FILE = "macro_configs.json"
+DEFAULT_COVER = "default_cover.jpg"
+AUDIO_SIGNATURE = "signature.mp3"
 
-class MusicEditor:
+class MusicBot:
     def __init__(self):
-        self.temp_dir = tempfile.mkdtemp()
-    
-    def extract_tags_and_cover(self, file_path):
-        """استخراج تگ‌ها و کاور از فایل موزیک"""
-        try:
-            audio_file = mutagen.File(file_path)
-            if audio_file is None:
-                return {}, None
-            
-            tags = {}
-            cover_data = None
-            
-            if hasattr(audio_file, 'tags') and audio_file.tags:
-                # استخراج تگ‌های مختلف
-                for key, value in audio_file.tags.items():
-                    if isinstance(value, list):
-                        value = value[0] if value else ""
-                    tags[key] = str(value)
-                
-                # استخراج کاور
-                if 'APIC:' in audio_file.tags:
-                    cover_data = audio_file.tags['APIC:'].data
-                elif hasattr(audio_file.tags, 'get'):
-                    apic = audio_file.tags.get('APIC:')
-                    if apic:
-                        cover_data = apic.data
-            
-            return tags, cover_data
-        except Exception as e:
-            print(f"خطا در استخراج تگ‌ها: {e}")
-            return {}, None
-    
-    def create_tag_image(self, tags, cover_data=None):
-        """ایجاد تصویر نمایش تگ‌ها"""
-        try:
-            # ایجاد کانوس
-            width, height = 800, 600
-            if cover_data:
-                # اگر کاور موجود است، از آن استفاده کن
-                cover_img = Image.open(BytesIO(cover_data))
-                cover_img = cover_img.resize((width, height))
-                img = cover_img.copy()
-            else:
-                # کاور پیش‌فرض
-                img = Image.new('RGB', (width, height), color='#1a1a1a')
-            
-            # اضافه کردن لایه شفاف برای متن
-            overlay = Image.new('RGBA', (width, height), (0, 0, 0, 180))
-            img = Image.alpha_composite(img.convert('RGBA'), overlay)
-            
-            draw = ImageDraw.Draw(img)
-            
-            # تنظیم فونت
-            try:
-                font_title = ImageFont.truetype("arial.ttf", 24)
-                font_normal = ImageFont.truetype("arial.ttf", 18)
-            except:
-                font_title = ImageFont.load_default()
-                font_normal = ImageFont.load_default()
-            
-            # نمایش تگ‌ها
-            y_pos = 50
-            for key, value in tags.items():
-                if value and str(value).strip():
-                    text = f"{key}: {value}"
-                    draw.text((50, y_pos), text, fill='white', font=font_normal)
-                    y_pos += 30
-                    if y_pos > height - 100:
-                        break
-            
-            # ذخیره تصویر
-            output_path = os.path.join(self.temp_dir, "tags_display.png")
-            img.convert('RGB').save(output_path)
-            return output_path
-        except Exception as e:
-            print(f"خطا در ایجاد تصویر تگ‌ها: {e}")
-            return None
-    
-    def clean_tags(self, tags):
-        """پاک کردن یوزرنیم‌ها و URL‌ها از تگ‌ها"""
-        cleaned_tags = {}
-        url_pattern = r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+'
-        username_pattern = r'@[a-zA-Z0-9_]+'
+        self.configs = self.load_configs()
         
-        for key, value in tags.items():
-            if isinstance(value, str):
-                # حذف URL‌ها
-                value = re.sub(url_pattern, '', value)
-                # حذف یوزرنیم‌ها
-                value = re.sub(username_pattern, '', value)
-                # پاک کردن فضاهای اضافی
-                value = ' '.join(value.split())
-                # اضافه کردن یوزرنیم جدید
-                if value.strip():
-                    value += " @abar"
-                else:
-                    value = "@abar"
-                cleaned_tags[key] = value
-            else:
-                cleaned_tags[key] = value
-        
-        return cleaned_tags
+    def load_configs(self):
+        """بارگیری تنظیمات از فایل"""
+        if os.path.exists(CONFIG_FILE):
+            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        return {}
     
-    def apply_tags_and_cover(self, audio_path, tags, cover_path=None):
-        """اعمال تگ‌ها و کاور جدید به فایل"""
-        try:
-            audio_file = MP3(audio_path)
-            
-            # حذف تگ‌های قبلی
-            if audio_file.tags:
-                audio_file.tags.delete()
-            
-            # اضافه کردن تگ‌های جدید
-            audio_file.tags = ID3()
-            
-            # پاک کردن و اعمال تگ‌ها
-            cleaned_tags = self.clean_tags(tags)
-            
-            for key, value in cleaned_tags.items():
-                if key.upper() == 'TIT2' or 'TITLE' in key.upper():
-                    audio_file.tags.add(TIT2(encoding=3, text=value))
-                elif key.upper() == 'TPE1' or 'ARTIST' in key.upper():
-                    audio_file.tags.add(TPE1(encoding=3, text=value))
-                elif key.upper() == 'TALB' or 'ALBUM' in key.upper():
-                    audio_file.tags.add(TALB(encoding=3, text=value))
-                elif key.upper() == 'TDRC' or 'DATE' in key.upper():
-                    audio_file.tags.add(TDRC(encoding=3, text=value))
-                elif key.upper() == 'TCON' or 'GENRE' in key.upper():
-                    audio_file.tags.add(TCON(encoding=3, text=value))
-            
-            # اضافه کردن کاور
-            if cover_path and os.path.exists(cover_path):
-                with open(cover_path, 'rb') as cover_file:
-                    cover_data = cover_file.read()
-                    audio_file.tags.add(APIC(
-                        encoding=3,
-                        mime='image/jpeg',
-                        type=3,
-                        desc='Cover',
-                        data=cover_data
-                    ))
-            
-            audio_file.save()
-            return True
-        except Exception as e:
-            print(f"خطا در اعمال تگ‌ها: {e}")
-            return False
+    def save_configs(self):
+        """ذخیره تنظیمات در فایل"""
+        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+            json.dump(self.configs, f, ensure_ascii=False, indent=2)
     
-    def create_bitrate_versions(self, input_path):
-        """ایجاد نسخه‌های مختلف بیت‌ریت"""
-        try:
-            audio = AudioSegment.from_mp3(input_path)
-            
-            # نسخه 320 kbps
-            output_320 = os.path.join(self.temp_dir, "320kbps.mp3")
-            audio.export(output_320, format="mp3", bitrate="320k")
-            
-            # نسخه 64 kbps
-            output_64 = os.path.join(self.temp_dir, "64kbps.mp3")
-            audio.export(output_64, format="mp3", bitrate="64k")
-            
-            return output_320, output_64
-        except Exception as e:
-            print(f"خطا در ایجاد نسخه‌های بیت‌ریت: {e}")
-            return None, None
+    def get_user_config(self, user_id):
+        """دریافت تنظیمات کاربر"""
+        return self.configs.get(str(user_id), {
+            'title': '{original_title}',
+            'artist': '{original_artist}',
+            'album': '{original_album}',
+            'year': '{original_year}',
+            'genre': '{original_genre}',
+            'apply_cover': True,
+            'watermark_text': '',
+            'watermark_image': None,
+            'remove_urls': True,
+            'trim_silence': True,
+            'add_signature': True,
+            'create_demo': True
+        })
     
-    def create_voice_preview(self, audio_64_path):
-        """ایجاد پیش‌نمایش صوتی (ثانیه 30 تا 60)"""
-        try:
-            audio = AudioSegment.from_mp3(audio_64_path)
-            
-            # برش ثانیه 30 تا 60
-            start_time = 30 * 1000  # به میلی‌ثانیه
-            end_time = 60 * 1000
-            
-            if len(audio) > end_time:
-                preview = audio[start_time:end_time]
-            else:
-                # اگر موزیک کوتاه‌تر است
-                preview = audio[start_time:] if len(audio) > start_time else audio
-            
-            output_path = os.path.join(self.temp_dir, "voice_preview.ogg")
-            preview.export(output_path, format="ogg")
-            
-            return output_path
-        except Exception as e:
-            print(f"خطا در ایجاد پیش‌نمایش: {e}")
-            return None
-    
-    def remove_silence(self, audio_path):
-        """حذف سکوت از ابتدا و انتهای فایل"""
-        try:
-            audio = AudioSegment.from_mp3(audio_path)
-            
-            # تشخیص قسمت‌های غیرساکت
-            nonsilent_ranges = detect_nonsilent(
-                audio, 
-                min_silence_len=1000,  # حداقل 1 ثانیه سکوت
-                silence_thresh=-40     # آستانه سکوت
-            )
-            
-            if nonsilent_ranges:
-                start_trim = nonsilent_ranges[0][0]
-                end_trim = nonsilent_ranges[-1][1]
-                trimmed_audio = audio[start_trim:end_trim]
-            else:
-                trimmed_audio = audio
-            
-            output_path = os.path.join(self.temp_dir, "trimmed_audio.mp3")
-            trimmed_audio.export(output_path, format="mp3")
-            
-            return output_path
-        except Exception as e:
-            print(f"خطا در حذف سکوت: {e}")
-            return audio_path
-    
-    def add_signature(self, audio_path):
-        """اضافه کردن امضای صوتی"""
-        try:
-            if not os.path.exists(SIGNATURE_AUDIO_PATH):
-                print("فایل امضای صوتی یافت نشد")
-                return audio_path
-            
-            main_audio = AudioSegment.from_mp3(audio_path)
-            signature = AudioSegment.from_mp3(SIGNATURE_AUDIO_PATH)
-            
-            # ترکیب امضا با موزیک اصلی
-            combined = signature.overlay(main_audio)
-            
-            output_path = os.path.join(self.temp_dir, "with_signature.mp3")
-            combined.export(output_path, format="mp3")
-            
-            return output_path
-        except Exception as e:
-            print(f"خطا در اضافه کردن امضا: {e}")
-            return audio_path
+    def set_user_config(self, user_id, config):
+        """تنظیم پیکربندی کاربر"""
+        self.configs[str(user_id)] = config
+        self.save_configs()
 
-# دستورات ربات
-@bot.message_handler(commands=['start'])
-async def start_command(message):
-    welcome_text = """🎵 خوش آمدید به ربات ویرایش موزیک!
+# ایجاد نمونه ربات
+music_bot = MusicBot()
 
-برای شروع، لطفاً فایل موزیک خود را ارسال کنید.
-
-قابلیت‌های ربات:
-✅ استخراج و نمایش تگ‌ها
-✅ اعمال کاور و تگ‌های جدید
-✅ پاک کردن یوزرنیم‌ها و لینک‌ها
-✅ ایجاد نسخه‌های 320 و 64 کیلوبیت
-✅ ایجاد پیش‌نمایش صوتی
-✅ حذف سکوت اضافی
-✅ اضافه کردن امضای صوتی"""
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """دستور شروع"""
+    keyboard = [
+        [InlineKeyboardButton("🎵 تنظیم ماکرو", callback_data="setup_macro")],
+        [InlineKeyboardButton("📋 مشاهده تنظیمات فعلی", callback_data="view_config")],
+        [InlineKeyboardButton("❓ راهنما", callback_data="help")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
     
-    await bot.send_message(message.chat.id, welcome_text)
+    welcome_text = """
+🎵 خوش آمدید به ربات پردازش موزیک! 
 
-@bot.message_handler(content_types=['audio', 'document'])
-async def handle_music(message):
+این ربات می‌تواند:
+• تگ‌های موزیک را ویرایش کند
+• کاور پیشفرض اعمال کند
+• فرمت را به MP3 تبدیل کند
+• واترمارک اضافه کند
+• URL ها را حذف کند
+• دو بیت ریت (320 و 64) ایجاد کند
+• دمو صوتی (30 ثانیه) بسازد
+• سکوت ابتدا و انتها را حذف کند
+• امضای صوتی اضافه کند
+
+لطفاً ابتدا ماکرو خود را تنظیم کنید.
+    """
+    
+    await update.message.reply_text(welcome_text, reply_markup=reply_markup)
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """مدیریت دکمه‌های اینلاین"""
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data == "setup_macro":
+        await setup_macro_start(query, context)
+    elif query.data == "view_config":
+        await view_config(query, context)
+    elif query.data == "help":
+        await show_help(query, context)
+    elif query.data.startswith("config_"):
+        await handle_config_option(query, context)
+
+async def setup_macro_start(query, context):
+    """شروع تنظیم ماکرو"""
+    user_id = query.from_user.id
+    config = music_bot.get_user_config(user_id)
+    
+    keyboard = [
+        [InlineKeyboardButton("📝 عنوان موزیک", callback_data="config_title")],
+        [InlineKeyboardButton("🎤 نام هنرمند", callback_data="config_artist")],
+        [InlineKeyboardButton("💿 نام آلبوم", callback_data="config_album")],
+        [InlineKeyboardButton("📅 سال انتشار", callback_data="config_year")],
+        [InlineKeyboardButton("🎭 ژانر", callback_data="config_genre")],
+        [InlineKeyboardButton("🖼️ تنظیمات کاور", callback_data="config_cover")],
+        [InlineKeyboardButton("💧 تنظیمات واترمارک", callback_data="config_watermark")],
+        [InlineKeyboardButton("✅ ذخیره و تمام", callback_data="save_config")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    text = """
+🔧 تنظیم ماکرو موزیک
+
+متغیرهای قابل استفاده:
+• {original_title} - عنوان اصلی
+• {original_artist} - هنرمند اصلی  
+• {original_album} - آلبوم اصلی
+• {original_year} - سال اصلی
+• {original_genre} - ژانر اصلی
+• {user_name} - نام کاربری شما
+• {channel_name} - نام کانال (اختیاری)
+
+گزینه مورد نظر را انتخاب کنید:
+    """
+    
+    await query.edit_message_text(text, reply_markup=reply_markup)
+
+async def handle_config_option(query, context):
+    """مدیریت انتخاب گزینه‌های تنظیمات"""
+    user_id = query.from_user.id
+    option = query.data.replace("config_", "")
+    
+    context.user_data['config_option'] = option
+    context.user_data['user_id'] = user_id
+    
+    prompts = {
+        'title': 'عنوان جدید موزیک را وارد کنید (از متغیرها استفاده کنید):',
+        'artist': 'نام هنرمند جدید را وارد کنید:',
+        'album': 'نام آلبوم جدید را وارد کنید:',
+        'year': 'سال انتشار را وارد کنید:',
+        'genre': 'ژانر موزیک را وارد کنید:',
+        'cover': 'کاور پیشفرض جدید را ارسال کنید (عکس):',
+        'watermark': 'متن واترمارک را وارد کنید (یا عکس واترمارک ارسال کنید):'
+    }
+    
+    await query.edit_message_text(prompts.get(option, 'مقدار را وارد کنید:'))
+
+async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """مدیریت پیام‌های متنی"""
+    if 'config_option' in context.user_data:
+        await handle_config_input(update, context)
+    else:
+        await update.message.reply_text("لطفاً ابتدا از منوی اصلی، ماکرو را تنظیم کنید.")
+
+async def handle_config_input(update: Update, context):
+    """مدیریت ورودی تنظیمات"""
+    user_id = context.user_data['user_id']
+    option = context.user_data['config_option']
+    value = update.message.text
+    
+    config = music_bot.get_user_config(user_id)
+    config[option] = value
+    music_bot.set_user_config(user_id, config)
+    
+    await update.message.reply_text(f"✅ {option} با موفقیت تنظیم شد!")
+    
+    # پاک کردن اطلاعات موقت
+    del context.user_data['config_option']
+    del context.user_data['user_id']
+
+async def audio_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """مدیریت فایل‌های صوتی"""
+    user_id = update.message.from_user.id
+    config = music_bot.get_user_config(user_id)
+    
+    if not config:
+        await update.message.reply_text("❌ لطفاً ابتدا ماکرو را تنظیم کنید.")
+        return
+    
+    await update.message.reply_text("🔄 در حال پردازش موزیک...")
+    
     try:
-        user_id = message.from_user.id
-        
-        # بررسی نوع فایل
-        if message.content_type == 'audio':
-            file_info = await bot.get_file(message.audio.file_id)
-            file_name = message.audio.file_name or "music.mp3"
-        elif message.content_type == 'document':
-            if not message.document.mime_type.startswith('audio/'):
-                await bot.reply_to(message, "❌ لطفاً فقط فایل‌های صوتی ارسال کنید.")
-                return
-            file_info = await bot.get_file(message.document.file_id)
-            file_name = message.document.file_name or "music.mp3"
-        
         # دانلود فایل
-        downloaded_file = await bot.download_file(file_info.file_path)
+        audio_file = await update.message.audio.get_file()
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.mp3') as temp_file:
+            await audio_file.download_to_drive(temp_file.name)
+            original_path = temp_file.name
         
-        # ذخیره فایل موقت
-        editor = MusicEditor()
-        original_path = os.path.join(editor.temp_dir, file_name)
-        
-        with open(original_path, 'wb') as f:
-            f.write(downloaded_file)
-        
-        # استخراج تگ‌ها و کاور
-        tags, cover_data = editor.extract_tags_and_cover(original_path)
-        
-        # ایجاد تصویر نمایش تگ‌ها
-        tags_image_path = editor.create_tag_image(tags, cover_data)
-        
-        if tags_image_path:
-            with open(tags_image_path, 'rb') as photo:
-                await bot.send_photo(
-                    message.chat.id, 
-                    photo, 
-                    caption="🏷️ تگ‌های فعلی موزیک:\n\nلطفاً کاور جدید و تگ‌های مورد نظر خود را ارسال کنید."
-                )
-        
-        # ذخیره اطلاعات جلسه کاربر
-        user_sessions[user_id] = {
-            'original_path': original_path,
-            'original_tags': tags,
-            'editor': editor,
-            'step': 'waiting_for_new_content'
-        }
-        
-    except Exception as e:
-        await bot.reply_to(message, f"❌ خطا در پردازش فایل: {str(e)}")
-
-@bot.message_handler(content_types=['photo'])
-async def handle_cover(message):
-    try:
-        user_id = message.from_user.id
-        
-        if user_id not in user_sessions or user_sessions[user_id]['step'] != 'waiting_for_new_content':
-            await bot.reply_to(message, "❌ ابتدا یک فایل موزیک ارسال کنید.")
-            return
-        
-        # دانلود کاور جدید
-        file_info = await bot.get_file(message.photo[-1].file_id)
-        downloaded_file = await bot.download_file(file_info.file_path)
-        
-        cover_path = os.path.join(user_sessions[user_id]['editor'].temp_dir, "new_cover.jpg")
-        with open(cover_path, 'wb') as f:
-            f.write(downloaded_file)
-        
-        user_sessions[user_id]['new_cover'] = cover_path
-        user_sessions[user_id]['step'] = 'waiting_for_tags'
-        
-        await bot.reply_to(message, "✅ کاور دریافت شد! حالا لطفاً تگ‌های جدید را به صورت متن ارسال کنید.\n\nمثال:\nTitle: نام آهنگ\nArtist: نام هنرمند\nAlbum: نام آلبوم")
-        
-    except Exception as e:
-        await bot.reply_to(message, f"❌ خطا در دریافت کاور: {str(e)}")
-
-@bot.message_handler(content_types=['text'])
-async def handle_tags(message):
-    try:
-        user_id = message.from_user.id
-        
-        if user_id not in user_sessions or user_sessions[user_id]['step'] != 'waiting_for_tags':
-            return
-        
-        # پارس کردن تگ‌های جدید
-        new_tags = {}
-        lines = message.text.split('\n')
-        for line in lines:
-            if ':' in line:
-                key, value = line.split(':', 1)
-                new_tags[key.strip()] = value.strip()
-        
-        if not new_tags:
-            await bot.reply_to(message, "❌ فرمت تگ‌ها صحیح نیست. لطفاً مثل این ارسال کنید:\nTitle: نام آهنگ\nArtist: نام هنرمند")
-            return
-        
-        session = user_sessions[user_id]
-        editor = session['editor']
-        
-        await bot.send_message(message.chat.id, "🔄 در حال پردازش... لطفاً صبر کنید.")
-        
-        # شروع پردازش
-        original_path = session['original_path']
-        
-        # حذف سکوت
-        trimmed_path = editor.remove_silence(original_path)
-        
-        # اضافه کردن امضا
-        # with_signature_path = editor.add_signature(trimmed_path)
-        
-        # اعمال تگ‌ها و کاور جدید
-        final_path = os.path.join(editor.temp_dir, "final_music.mp3")
-        os.rename(trimmed_path, final_path)
-        
-        editor.apply_tags_and_cover(
-            final_path, 
-            new_tags, 
-            session.get('new_cover')
-        )
-        
-        # ایجاد نسخه‌های مختلف بیت‌ریت
-        path_320, path_64 = editor.create_bitrate_versions(final_path)
-        
-        # ایجاد پیش‌نمایش صوتی
-        voice_preview_path = editor.create_voice_preview(path_64)
-        
-        # ایجاد تصویر تگ‌های جدید
-        final_tags, final_cover = editor.extract_tags_and_cover(final_path)
-        tags_image_path = editor.create_tag_image(final_tags, final_cover)
+        # پردازش موزیک
+        processed_files = await process_audio(original_path, config, user_id)
         
         # ارسال نتایج
-        if tags_image_path:
-            with open(tags_image_path, 'rb') as photo:
-                await bot.send_photo(
-                    message.chat.id, 
-                    photo, 
-                    caption="🎵 تگ‌های جدید اعمال شد!"
-                )
+        await send_results(update, processed_files)
         
-        # ارسال پیش‌نمایش صوتی
-        if voice_preview_path:
-            with open(voice_preview_path, 'rb') as voice:
-                await bot.send_voice(
-                    message.chat.id, 
-                    voice, 
-                    caption="🎧 پیش‌نمایش صوتی (ثانیه 30-60)"
-                )
-        
-        # ارسال فایل نهایی
-        if path_320:
-            with open(path_320, 'rb') as audio:
-                await bot.send_audio(
-                    message.chat.id, 
-                    audio, 
-                    caption="🎵 موزیک ویرایش شده (320 kbps)"
-                )
-        
-        # پاک کردن جلسه کاربر
-        del user_sessions[user_id]
-        
-        await bot.send_message(message.chat.id, "✅ پردازش با موفقیت تکمیل شد!")
+        # پاک‌سازی فایل‌های موقت
+        cleanup_temp_files([original_path] + list(processed_files.values()))
         
     except Exception as e:
-        await bot.reply_to(message, f"❌ خطا در پردازش: {str(e)}")
+        logger.error(f"خطا در پردازش صوت: {e}")
+        await update.message.reply_text(f"❌ خطا در پردازش: {str(e)}")
 
-# اجرای ربات
-if __name__ == "__main__":
-    print("🤖 ربات در حال اجرا...")
-    asyncio.run(bot.polling())
+async def process_audio(input_path, config, user_id):
+    """پردازش کامل فایل صوتی"""
+    results = {}
+    
+    try:
+        # بارگیری فایل صوتی
+        audio = AudioSegment.from_file(input_path)
+        
+        # تبدیل به MP3 در صورت نیاز
+        if not input_path.lower().endswith('.mp3'):
+            mp3_path = input_path.replace(os.path.splitext(input_path)[1], '.mp3')
+            audio.export(mp3_path, format="mp3", bitrate="320k")
+            input_path = mp3_path
+        
+        # حذف سکوت از ابتدا و انتها
+        if config.get('trim_silence', True):
+            audio = trim_silence(audio)
+        
+        # اضافه کردن امضای صوتی
+        if config.get('add_signature', True) and os.path.exists(AUDIO_SIGNATURE):
+            signature = AudioSegment.from_file(AUDIO_SIGNATURE)
+            audio = signature.overlay(audio)
+        
+        # ایجاد نسخه 320 کیلوبیت
+        high_quality_path = tempfile.mktemp(suffix='_320k.mp3')
+        audio.export(high_quality_path, format="mp3", bitrate="320k")
+        results['high_quality'] = high_quality_path
+        
+        # ایجاد نسخه 64 کیلوبیت
+        low_quality_path = tempfile.mktemp(suffix='_64k.mp3')
+        audio.export(low_quality_path, format="mp3", bitrate="64k")
+        
+        # ایجاد دمو (ثانیه 30 تا 60)
+        if config.get('create_demo', True):
+            demo_audio = AudioSegment.from_file(low_quality_path)
+            if len(demo_audio) > 60000:  # اگر بیشتر از 60 ثانیه باشد
+                demo_audio = demo_audio[30000:60000]  # ثانیه 30 تا 60
+            else:
+                demo_audio = demo_audio[:30000]  # 30 ثانیه اول
+            
+            demo_path = tempfile.mktemp(suffix='_demo.ogg')
+            demo_audio.export(demo_path, format="ogg")
+            results['demo'] = demo_path
+        
+        # اعمال تگ‌ها و کاور
+        await apply_tags_and_cover(high_quality_path, config, user_id)
+        await apply_tags_and_cover(low_quality_path, config, user_id)
+        
+        results['low_quality'] = low_quality_path
+        
+        return results
+        
+    except Exception as e:
+        logger.error(f"خطا در پردازش صوت: {e}")
+        raise e
+
+async def apply_tags_and_cover(audio_path, config, user_id):
+    """اعمال تگ‌ها و کاور"""
+    try:
+        # بارگیری اطلاعات فعلی
+        audiofile = MP3(audio_path, ID3=ID3)
+        if audiofile.tags is None:
+            audiofile.add_tags()
+        
+        # دریافت تگ‌های اصلی
+        original_tags = {
+            'original_title': str(audiofile.tags.get('TIT2', '')),
+            'original_artist': str(audiofile.tags.get('TPE1', '')),
+            'original_album': str(audiofile.tags.get('TALB', '')),
+            'original_year': str(audiofile.tags.get('TYER', '')),
+            'original_genre': str(audiofile.tags.get('TCON', '')),
+            'user_name': f"@user_{user_id}",
+            'channel_name': config.get('channel_name', '')
+        }
+        
+        # حذف URL ها از تگ‌های قدیمی
+        if config.get('remove_urls', True):
+            for tag_name in ['TIT2', 'TPE1', 'TALB', 'TPE2']:
+                if tag_name in audiofile.tags:
+                    old_value = str(audiofile.tags[tag_name])
+                    new_value = remove_urls_and_usernames(old_value)
+                    original_tags[f'original_{tag_name.lower().replace("tpe1", "artist").replace("tit2", "title").replace("talb", "album")}'] = new_value
+        
+        # اعمال تگ‌های جدید
+        new_title = format_template(config.get('title', '{original_title}'), original_tags)
+        new_artist = format_template(config.get('artist', '{original_artist}'), original_tags)
+        new_album = format_template(config.get('album', '{original_album}'), original_tags)
+        new_year = format_template(config.get('year', '{original_year}'), original_tags)
+        new_genre = format_template(config.get('genre', '{original_genre}'), original_tags)
+        
+        audiofile.tags['TIT2'] = TIT2(encoding=3, text=new_title)
+        audiofile.tags['TPE1'] = TPE1(encoding=3, text=new_artist)
+        audiofile.tags['TALB'] = TALB(encoding=3, text=new_album)
+        audiofile.tags['TYER'] = TYER(encoding=3, text=new_year)
+        audiofile.tags['TCON'] = TCON(encoding=3, text=new_genre)
+        
+        # اعمال کاور
+        if config.get('apply_cover', True) and os.path.exists(DEFAULT_COVER):
+            cover_path = DEFAULT_COVER
+            
+            # اعمال واترمارک در صورت نیاز
+            if config.get('watermark_text') or config.get('watermark_image'):
+                cover_path = await apply_watermark(DEFAULT_COVER, config)
+            
+            with open(cover_path, 'rb') as albumart:
+                audiofile.tags['APIC'] = APIC(
+                    encoding=3,
+                    mime='image/jpeg',
+                    type=3,
+                    desc=u'Cover',
+                    data=albumart.read()
+                )
+        
+        audiofile.save()
+        
+    except Exception as e:
+        logger.error(f"خطا در اعمال تگ‌ها: {e}")
+
+async def apply_watermark(image_path, config):
+    """اعمال واترمارک بر روی تصویر"""
+    try:
+        img = Image.open(image_path)
+        
+        if config.get('watermark_text'):
+            # واترمارک متنی
+            draw = ImageDraw.Draw(img)
+            # استفاده از فونت پیشفرض
+            try:
+                font = ImageFont.truetype("arial.ttf", 40)
+            except:
+                font = ImageFont.load_default()
+            
+            text = config['watermark_text']
+            bbox = draw.textbbox((0, 0), text, font=font)
+            text_width = bbox[2] - bbox[0]
+            text_height = bbox[3] - bbox[1]
+            
+            # محاسبه موقعیت مرکز پایین
+            x = (img.width - text_width) // 2
+            y = img.height - text_height - 20
+            
+            # رسم سایه
+            draw.text((x+2, y+2), text, font=font, fill=(0, 0, 0, 128))
+            # رسم متن اصلی
+            draw.text((x, y), text, font=font, fill=(255, 255, 255, 255))
+        
+        # ذخیره تصویر واترمارک شده
+        watermarked_path = tempfile.mktemp(suffix='_watermarked.jpg')
+        img.save(watermarked_path, 'JPEG')
+        return watermarked_path
+        
+    except Exception as e:
+        logger.error(f"خطا در اعمال واترمارک: {e}")
+        return image_path
+
+def remove_urls_and_usernames(text):
+    """حذف URL ها و یوزرنیم‌ها از متن"""
+    # حذف URL ها
+    text = re.sub(r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+', '', text)
+    # حذف یوزرنیم‌ها
+    text = re.sub(r'@\w+', '', text)
+    # حذف فضاهای اضافی
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
+def format_template(template, variables):
+    """فرمت کردن الگو با متغیرها"""
+    try:
+        return template.format(**variables)
+    except KeyError as e:
+        logger.warning(f"متغیر ناشناخته: {e}")
+        return template
+
+async def send_results(update, files):
+    """ارسال نتایج پردازش"""
+    try:
+        # ارسال کاور با تگ‌ها
+        await update.message.reply_text("✅ پردازش کامل شد!\n\n📸 کاور با تگ‌های جدید:")
+        
+        if os.path.exists(DEFAULT_COVER):
+            with open(DEFAULT_COVER, 'rb') as cover:
+                await update.message.reply_photo(cover, caption="🎵 کاور موزیک با تگ‌های جدید")
+        
+        # ارسال دمو
+        if 'demo' in files and os.path.exists(files['demo']):
+            await update.message.reply_text("🎧 نمونه 30 ثانیه‌ای:")
+            with open(files['demo'], 'rb') as demo:
+                await update.message.reply_voice(demo, caption="🎵 دمو موزیک (30 ثانیه)")
+        
+        # ارسال نسخه نهایی با کیفیت بالا
+        if 'high_quality' in files and os.path.exists(files['high_quality']):
+            await update.message.reply_text("🎵 موزیک نهایی (320 کیلوبیت):")
+            with open(files['high_quality'], 'rb') as audio:
+                await update.message.reply_audio(
+                    audio,
+                    caption="🎵 موزیک پردازش شده - کیفیت بالا (320k)",
+                    title="Processed Audio"
+                )
+                
+    except Exception as e:
+        logger.error(f"خطا در ارسال نتایج: {e}")
+        await update.message.reply_text(f"❌ خطا در ارسال: {str(e)}")
+
+def cleanup_temp_files(file_paths):
+    """پاک‌سازی فایل‌های موقت"""
+    for file_path in file_paths:
+        try:
+            if file_path and os.path.exists(file_path):
+                os.unlink(file_path)
+        except Exception as e:
+            logger.warning(f"خطا در پاک‌سازی فایل {file_path}: {e}")
+
+async def view_config(query, context):
+    """نمایش تنظیمات فعلی"""
+    user_id = query.from_user.id
+    config = music_bot.get_user_config(user_id)
+    
+    config_text = f"""
+📋 تنظیمات فعلی شما:
+
+📝 عنوان: {config.get('title', 'تنظیم نشده')}
+🎤 هنرمند: {config.get('artist', 'تنظیم نشده')}
+💿 آلبوم: {config.get('album', 'تنظیم نشده')}
+📅 سال: {config.get('year', 'تنظیم نشده')}
+🎭 ژانر: {config.get('genre', 'تنظیم نشده')}
+
+🖼️ کاور پیشفرض: {'✅ فعال' if config.get('apply_cover') else '❌ غیرفعال'}
+💧 واترمارک: {config.get('watermark_text', 'تنظیم نشده')}
+🔗 حذف URL: {'✅ فعال' if config.get('remove_urls') else '❌ غیرفعال'}
+🔇 حذف سکوت: {'✅ فعال' if config.get('trim_silence') else '❌ غیرفعال'}
+🎵 امضای صوتی: {'✅ فعال' if config.get('add_signature') else '❌ غیرفعال'}
+🎧 ایجاد دمو: {'✅ فعال' if config.get('create_demo') else '❌ غیرفعال'}
+    """
+    
+    keyboard = [[InlineKeyboardButton("🔙 بازگشت", callback_data="back_to_main")]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.edit_message_text(config_text, reply_markup=reply_markup)
+
+async def show_help(query, context):
+    """نمایش راهنما"""
+    help_text = """
+📖 راهنمای استفاده:
+
+1️⃣ ابتدا با دکمه "تنظیم ماکرو" تنظیمات خود را انجام دهید
+2️⃣ فایل صوتی خود را ارسال کنید
+3️⃣ ربات موزیک را پردازش کرده و نتیجه را ارسال می‌کند
+
+🔧 قابلیت‌ها:
+• تغییر تگ‌های موزیک
+• اعمال کاور پیشفرض
+• تبدیل فرمت به MP3
+• اضافه کردن واترمارک
+• حذف URL و یوزرنیم‌ها
+• ایجاد دو نسخه (320k و 64k)
+• ساخت دمو 30 ثانیه‌ای
+• حذف سکوت
+• اضافه کردن امضای صوتی
+
+📝 متغیرهای قابل استفاده:
+{original_title} - عنوان اصلی
+{original_artist} - هنرمند اصلی  
+{original_album} - آلبوم اصلی
+{user_name} - نام کاربری شما
+    """
+    
+    keyboard = [[InlineKeyboardButton("🔙 بازگشت", callback_data="back_to_main")]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.edit_message_text(help_text, reply_markup=reply_markup)
+
+def main():
+    """اجرای اصلی ربات"""
+    # ایجاد اپلیکیشن
+    application = Application.builder().token(BOT_TOKEN).build()
+    
+    # اضافه کردن هندلرها
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CallbackQueryHandler(button_handler))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+    application.add_handler(MessageHandler(filters.AUDIO, audio_handler))
+    
+    # شروع ربات
+    print("🎵 ربات پردازش موزیک شروع شد...")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+if __name__ == '__main__':
+    main()
