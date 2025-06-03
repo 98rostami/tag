@@ -389,7 +389,7 @@ async def handle_tags(message):
         trimmed_path = editor.remove_silence(original_path)
         
         # اضافه کردن امضا
-        with_signature_path = editor.add_signature(trimmed_path)
+        # with_signature_path = editor.add_signature(trimmed_path)
         
         # اعمال تگ‌ها و کاور جدید
         final_path = os.path.join(editor.temp_dir, "final_music.mp3")
