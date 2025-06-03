@@ -393,7 +393,7 @@ async def handle_tags(message):
         
         # اعمال تگ‌ها و کاور جدید
         final_path = os.path.join(editor.temp_dir, "final_music.mp3")
-        os.rename(with_signature_path, final_path)
+        os.rename(trimmed_path, final_path)
         
         editor.apply_tags_and_cover(
             final_path, 
